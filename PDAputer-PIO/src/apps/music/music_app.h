@@ -4,7 +4,7 @@
 #include "../../app_manager/app_manager.h"
 #include <lvgl.h>
 #include <SD.h>
-#include <driver/i2s_std.h>
+#include <driver/i2s.h>
 
 struct __attribute__((packed)) wav_header_t {
     char     RIFF[4];
@@ -58,7 +58,7 @@ private:
     int _current_track = 0;
 
     // I2S output
-    i2s_chan_handle_t _i2s_tx = nullptr;
+    bool _i2s_installed = false;
     bool _i2s_running = false;
     void setupI2S(uint32_t sample_rate, bool stereo);
     void teardownI2S();

@@ -131,6 +131,8 @@ void BootApp::updateWaiting() {
         SDManager::begin();
         ConfigManager::load();
         WifiManager::begin(); // Non-blocking, connects in background
+
+        ConfigManager::start();
     }
 
     if (millis() - _wait_start >= WAIT_DURATION_MS) {
@@ -140,4 +142,9 @@ void BootApp::updateWaiting() {
         }
         _phase = PHASE_DONE;
     }
+}
+
+void BootApp::update() {
+    // Update config manager (handles serial config interface)
+    ConfigManager::update();
 }

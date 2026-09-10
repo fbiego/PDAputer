@@ -17,6 +17,8 @@ public:
 
     void setNextApp(AppBase* next) { _next_app = next; }
 
+    void update();
+
 private:
     AppManager& _manager;
     AppBase* _next_app = nullptr;

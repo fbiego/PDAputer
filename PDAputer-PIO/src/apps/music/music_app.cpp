@@ -7,12 +7,17 @@
 #include <config_manager.h>
 #include <SD.h>
 #include <MP3DecoderHelix.h>
-#include <driver/i2s_std.h>
+#include <driver/i2s.h>
 
 // I2S pins for M5Cardputer
 #define I2S_DOUT_PIN 42
 #define I2S_BCLK_PIN 41
 #define I2S_LRCK_PIN 43
+
+static libhelix::MP3DecoderHelix* s_mp3 = nullptr;
+static bool s_i2s_ready = false;
+static int16_t s_volume = 16;
+static volatile bool s_first_frame = true;
 
 // ============================================================
 // LVGL timer callback
@@ -30,59 +35,68 @@ void MusicApp::animTimerCb(lv_timer_t* t) {
 void MusicApp::setupI2S(uint32_t sample_rate, bool stereo) {
     teardownI2S();
 
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 8;
-    chan_cfg.dma_frame_num = 256;
-    i2s_new_channel(&chan_cfg, &_i2s_tx, NULL);
+    i2s_config_t i2s_config = {};
+    i2s_config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+    i2s_config.sample_rate = sample_rate;
+    i2s_config.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+    i2s_config.channel_format = stereo ? I2S_CHANNEL_FMT_RIGHT_LEFT : I2S_CHANNEL_FMT_ONLY_LEFT;
+    i2s_config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+    i2s_config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+    i2s_config.dma_buf_count = 8;
+    i2s_config.dma_buf_len = 256;
+    i2s_config.use_apll = false;
+    i2s_config.tx_desc_auto_clear = true;
+    i2s_config.fixed_mclk = 0;
 
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-            I2S_DATA_BIT_WIDTH_16BIT,
-            stereo ? I2S_SLOT_MODE_STEREO : I2S_SLOT_MODE_MONO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = (gpio_num_t)I2S_BCLK_PIN,
-            .ws = (gpio_num_t)I2S_LRCK_PIN,
-            .dout = (gpio_num_t)I2S_DOUT_PIN,
-            .din = I2S_GPIO_UNUSED,
-            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
-        },
-    };
+    i2s_pin_config_t pin_config = {};
+    pin_config.mck_io_num = I2S_PIN_NO_CHANGE;
+    pin_config.bck_io_num = I2S_BCLK_PIN;
+    pin_config.ws_io_num = I2S_LRCK_PIN;
+    pin_config.data_out_num = I2S_DOUT_PIN;
+    pin_config.data_in_num = I2S_PIN_NO_CHANGE;
 
-    i2s_channel_init_std_mode(_i2s_tx, &std_cfg);
-    i2s_channel_enable(_i2s_tx);
+    if (i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL) != ESP_OK) {
+        Serial.println("[MUSIC] Failed to install I2S driver");
+        return;
+    }
+    _i2s_installed = true;
+
+    if (i2s_set_pin(I2S_NUM_0, &pin_config) != ESP_OK ||
+        i2s_set_clk(I2S_NUM_0, sample_rate, I2S_BITS_PER_SAMPLE_16BIT,
+                    stereo ? I2S_CHANNEL_STEREO : I2S_CHANNEL_MONO) != ESP_OK) {
+        Serial.println("[MUSIC] Failed to configure I2S");
+        teardownI2S();
+        return;
+    }
+
+    i2s_start(I2S_NUM_0);
     _i2s_running = true;
 }
 
 void MusicApp::teardownI2S() {
-    if (_i2s_tx) {
+    if (_i2s_installed) {
         if (_i2s_running) {
-            i2s_channel_disable(_i2s_tx);
+            i2s_stop(I2S_NUM_0);
             _i2s_running = false;
         }
-        i2s_del_channel(_i2s_tx);
-        _i2s_tx = nullptr;
+        i2s_driver_uninstall(I2S_NUM_0);
+        _i2s_installed = false;
     }
+    s_i2s_ready = false;
 }
 
 // ============================================================
 // MP3 decoder + I2S write
 // ============================================================
 
-static libhelix::MP3DecoderHelix* s_mp3 = nullptr;
-static i2s_chan_handle_t s_i2s_tx = nullptr;
-static int16_t s_volume = 16;
-static volatile bool s_first_frame = true;
-
 static void mp3DataCb(MP3FrameInfo &info, short *pcm, size_t len, void *ref) {
-    if (len == 0 || !s_i2s_tx) return;
+    if (len == 0 || !s_i2s_ready) return;
 
     if (s_first_frame) {
-        i2s_channel_disable(s_i2s_tx);
-        i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(info.samprate);
-        i2s_channel_reconfig_std_clock(s_i2s_tx, &clk);
-        i2s_channel_enable(s_i2s_tx);
+        i2s_stop(I2S_NUM_0);
+        i2s_set_clk(I2S_NUM_0, info.samprate, I2S_BITS_PER_SAMPLE_16BIT,
+                    info.nChans > 1 ? I2S_CHANNEL_STEREO : I2S_CHANNEL_MONO);
+        i2s_start(I2S_NUM_0);
         s_first_frame = false;
         Serial.printf("[MUSIC] MP3: %dHz %dch %dkbps\n",
                       info.samprate, info.nChans, info.bitrate / 1000);
@@ -93,7 +107,7 @@ static void mp3DataCb(MP3FrameInfo &info, short *pcm, size_t len, void *ref) {
     }
 
     size_t bytes_written;
-    i2s_channel_write(s_i2s_tx, pcm, len * sizeof(short), &bytes_written, pdMS_TO_TICKS(100));
+    i2s_write(I2S_NUM_0, pcm, len * sizeof(short), &bytes_written, pdMS_TO_TICKS(100));
 }
 
 // ============================================================
@@ -130,7 +144,7 @@ void MusicApp::audioTaskFunc(void* param) {
                         tmp[i] = ((int16_t)buf[i] - 128) * s_volume * 256 / 21;
                     }
                     size_t written;
-                    i2s_channel_write(self->_i2s_tx, tmp, rd * 2, &written, pdMS_TO_TICKS(100));
+                    i2s_write(I2S_NUM_0, tmp, rd * 2, &written, pdMS_TO_TICKS(100));
                 } else {
                     int16_t* samples = (int16_t*)buf;
                     size_t count = rd / 2;
@@ -138,7 +152,7 @@ void MusicApp::audioTaskFunc(void* param) {
                         samples[i] = (int32_t)samples[i] * s_volume / 21;
                     }
                     size_t written;
-                    i2s_channel_write(self->_i2s_tx, buf, rd, &written, pdMS_TO_TICKS(100));
+                    i2s_write(I2S_NUM_0, buf, rd, &written, pdMS_TO_TICKS(100));
                 }
             }
         }
@@ -387,7 +401,7 @@ bool MusicApp::openMp3(int track_idx) {
     s_first_frame = true;
 
     setupI2S(44100, true);
-    s_i2s_tx = _i2s_tx;
+    s_i2s_ready = _i2s_installed;
 
     if (!s_mp3) s_mp3 = new libhelix::MP3DecoderHelix();
     s_mp3->setDataCallback(mp3DataCb);
@@ -401,9 +415,9 @@ void MusicApp::stopPlayback() {
     _active = false;
     _playing = false;
 
-    // Disable I2S to unblock any i2s_channel_write() stuck in audio task
-    if (_i2s_tx && _i2s_running) {
-        i2s_channel_disable(_i2s_tx);
+    // Disable I2S to unblock any i2s_write() stuck in audio task
+    if (_i2s_installed && _i2s_running) {
+        i2s_stop(I2S_NUM_0);
         _i2s_running = false;
     }
 
@@ -423,9 +437,9 @@ void MusicApp::seekRelative(int seconds) {
     bool was_playing = _playing;
     _playing = false;
 
-    // Disable I2S to unblock any stuck i2s_channel_write
-    if (_i2s_tx && _i2s_running) {
-        i2s_channel_disable(_i2s_tx);
+    // Disable I2S to unblock any stuck i2s_write
+    if (_i2s_installed && _i2s_running) {
+        i2s_stop(I2S_NUM_0);
         _i2s_running = false;
     }
 
@@ -468,8 +482,8 @@ void MusicApp::seekRelative(int seconds) {
     _play_start_ms = millis();
 
     // Re-enable I2S before resuming playback
-    if (was_playing && _i2s_tx && !_i2s_running) {
-        i2s_channel_enable(_i2s_tx);
+    if (was_playing && _i2s_installed && !_i2s_running) {
+        i2s_start(I2S_NUM_0);
         _i2s_running = true;
     }
 
@@ -585,14 +599,14 @@ void MusicApp::onKeyPressed(char key) {
                 _playing = false;
                 // Wait for audio task to exit its read/write loop
                 vTaskDelay(pdMS_TO_TICKS(30));
-                if (_i2s_tx && _i2s_running) {
-                    i2s_channel_disable(_i2s_tx);
+                if (_i2s_installed && _i2s_running) {
+                    i2s_stop(I2S_NUM_0);
                     _i2s_running = false;
                 }
             } else {
                 if (_active && _data_remaining > 0) {
-                    if (_i2s_tx && !_i2s_running) {
-                        i2s_channel_enable(_i2s_tx);
+                    if (_i2s_installed && !_i2s_running) {
+                        i2s_start(I2S_NUM_0);
                         _i2s_running = true;
                     }
                     _play_start_ms = millis();

@@ -1,5 +1,8 @@
 #include "config_manager.h"
 #include <SD.h>
+#include <Preferences.h>
+#include <ESPConfig.h>
+#include <ESPConfigSerialInterface.h>
 
 #define CONFIG_PATH "/PDAputer/config.txt"
 #define MAX_ENTRIES 16
@@ -7,6 +10,11 @@
 #define MAX_VAL_LEN 128
 
 namespace ConfigManager {
+
+using namespace ESPConfig;
+Preferences prefs;
+ESPConfigManager config;
+ESPConfigSerialInterface configSerial(Serial, config, "PDAputer");
 
 struct Entry {
     char key[MAX_KEY_LEN];
@@ -16,6 +24,11 @@ struct Entry {
 static Entry s_entries[MAX_ENTRIES];
 static int   s_count = 0;
 static bool  s_loaded = false;
+static bool  s_prefs_started = false;
+static bool  sd_available = false;
+static bool  s_config_started = false;
+static String s_pref_values[8];
+static uint8_t s_pref_value_idx = 0;
 
 // Trim leading/trailing whitespace in-place
 static void trim(char* s) {
@@ -35,10 +48,15 @@ bool load() {
     s_count = 0;
     s_loaded = false;
 
+    if (!s_prefs_started) {
+        s_prefs_started = prefs.begin("config", false);
+    }
+    
     File f = SD.open(CONFIG_PATH, FILE_READ);
     if (!f) {
         Serial.printf("[CONFIG] %s not found\n", CONFIG_PATH);
-        return false;
+        s_loaded = s_prefs_started; // Default to Preferences if config file is missing
+        return s_prefs_started; // Default to Preferences if config file is missing
     }
 
     char line[MAX_KEY_LEN + MAX_VAL_LEN + 4];
@@ -71,6 +89,7 @@ bool load() {
 
     f.close();
     s_loaded = true;
+    sd_available = true;
     Serial.printf("[CONFIG] Loaded %d entries from %s\n", s_count, CONFIG_PATH);
     return true;
 }
@@ -85,7 +104,9 @@ const char* get(const char* key, const char* defaultVal) {
             return s_entries[i].val;
         }
     }
-    return defaultVal;
+    String& value = s_pref_values[s_pref_value_idx++ % 8];
+    value = s_prefs_started ? prefs.getString(key, String(defaultVal)) : String(defaultVal);
+    return value.c_str(); // Fallback to Preferences
 }
 
 const char* getDeviceName()   { return get("device_name", "PDA"); }
@@ -98,6 +119,16 @@ const char* getBrightness()   { return get("brightness", "128"); }
 const char* getTone()         { return get("tone", "128"); }
 
 bool set(const char* key, const char* value) {
+
+    if (s_prefs_started) {
+        prefs.putString(key, value); // Save to Preferences
+    }
+
+    if (!sd_available) {
+        Serial.printf("[CONFIG] SD not available, skipping save for %s\n", key);
+        return true; // Skip SD save if not available
+    }
+
     // Update in-memory
     for (int i = 0; i < s_count; i++) {
         if (strcasecmp(s_entries[i].key, key) == 0) {
@@ -127,6 +158,42 @@ write_file:
     f.close();
     Serial.printf("[CONFIG] Saved %s = %s\n", key, value);
     return true;
+}
+
+void handleAnyConfigChanged(const ConfigField& field) {
+  set(field.key.c_str(), field.value.c_str());
+}
+
+void start() {
+    if (s_config_started) {
+        return;
+    }
+
+    config.addString("device_name", "Device Name", String(getDeviceName()));
+    config.addString("wifi_ssid", "WiFi SSID", String(getWifiSSID()));
+    config.addString("wifi_password", "WiFi Password", String(getWifiPassword()));
+    config.addString("timezone", "Timezone", String(getTimezone()));
+    config.addString("api_key", "API Key", String(getApiKey()));
+    config.addString("time_format", "Time Format (12/24)", String(getTimeFormat()));
+    config.addInteger("brightness", "Brightness", atoi(getBrightness()));
+    config.addInteger("tone", "Tone", atoi(getTone()));
+
+    config.addAction("esp_restart", "Restart Device", []() {
+        ESP.restart();
+    }, true);
+
+    config.setOnChange(handleAnyConfigChanged);
+
+    // configSerial.setPassword("change-me");
+    configSerial.begin();
+
+    Serial.println("[CONFIG] SerialConfig started");
+    Serial.println(config.toJson());
+    s_config_started = true;
+}
+
+void update() {
+    configSerial.update();
 }
 
 } // namespace ConfigManager

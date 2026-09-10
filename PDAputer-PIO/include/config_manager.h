@@ -23,6 +23,10 @@ namespace ConfigManager {
 
     // Write a key=value back to config.txt on SD
     bool set(const char* key, const char* value);
+
+    // ESPConfig serial configurator. Call start() once, update() every loop.
+    void start();
+    void update();
 }
 
 #endif // CONFIG_MANAGER_H
